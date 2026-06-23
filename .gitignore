@@ -1,0 +1,14 @@
+# Build output
+dist/
+ctf-agent
+
+# Config with potential secrets
+config.yaml
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

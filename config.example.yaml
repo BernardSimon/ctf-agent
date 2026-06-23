@@ -1,0 +1,77 @@
+# ============================================
+# CTF Agent 配置文件
+# 所有路径相对于程序目录（二进制所在目录）
+# ============================================
+
+llm:
+  # 模型提供商: ollama（本地）或 openai（任何OpenAI兼容接口）
+  provider: openai
+
+  # API地址
+  # Ollama默认: http://localhost:11434
+  # OpenAI: https://api.openai.com
+  # 兼容接口: http://your-server:port
+  base_url: https://api.openai.com/v1
+
+  # 模型名称
+  # Ollama示例: qwen2.5-coder:7b, qwen2.5-coder:14b, deepseek-r1:14b, llama3.1:8b
+  # OpenAI示例: gpt-4o, gpt-4o-mini
+  model: gpt-4o
+
+  # API密钥（Ollama不需要，OpenAI兼容接口需要）
+  api_key: "your-api-key-here"
+
+  # 工具调用模式:
+  #   false = 从模型输出文本中解析工具调用（默认，兼容所有模型）
+  #   true  = 使用原生function calling接口（需要模型支持）
+  function_calling: true
+
+runtime:
+  # 运行环境:
+  #   local    = Agent运行在普通本机，可通过SSH连接Kali（如需）
+  #   kali     = Agent本身运行在Kali中，优先用run_command直接调用Kali工具
+  #   ssh_kali = Agent运行在普通本机，并通过ssh_command使用远程Kali
+  mode: local
+
+ssh:
+  # 是否启用SSH连接Kali系统
+  enabled: false
+
+  # Kali系统地址（局域网IP或hostname）
+  host: 192.168.1.100
+
+  # SSH端口
+  port: 22
+
+  # 登录用户
+  user: kali
+
+  # SSH私钥路径（相对于程序目录，或绝对路径）
+  # 留空则自动检测 ~/.ssh/id_ed25519 或 ~/.ssh/id_rsa
+  key_path: ""
+
+  # 远程Kali命令超时秒数。端口扫描、目录爆破、sqlmap等建议300-900。
+  command_timeout_seconds: 600
+
+agent:
+  # 上下文token上限（估算值，8-14B建议4096-8192，30B可按显存提高到8192-16384）
+  max_context_tokens: 6144
+
+  # 保留的最大历史消息数
+  max_history_messages: 16
+
+  # 单次任务最多连续工具调用轮数。小模型建议6-10，避免卡在循环里。
+  max_tool_iterations: 8
+
+  # 每个工具结果回灌给模型的最大字符数，避免8-30B模型上下文被日志淹没。
+  tool_output_limit: 2500
+
+  # 本机命令超时秒数。Agent运行在Kali本机时，kali_command也使用这个超时。
+  command_timeout_seconds: 180
+
+  # 离线模式：web_fetch仅允许localhost、内网IP、*.local和裸主机名，拒绝公网域名/IP。
+  offline_mode: true
+
+  # 系统提示词文件（相对于程序目录）
+  # 可自定义提示词，{{TOOLS}} 会被替换为工具描述
+  system_prompt_file: system_prompt.txt
