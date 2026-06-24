@@ -2,9 +2,14 @@ package agent
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
+	"sort"
 	"strings"
 
 	"ctf-agent/internal/llm"
@@ -20,7 +25,9 @@ type Agent struct {
 	verbose         bool
 	maxIterations   int
 	toolOutputLimit int
+	dupCallWindow   int
 	modelName       string
+	onToolResult    func(name, result string) // 用于 flag 自动识别等中间件
 }
 
 type Config struct {
@@ -31,7 +38,9 @@ type Config struct {
 	Verbose         bool
 	MaxIterations   int
 	ToolOutputLimit int
+	DupCallWindow   int
 	ModelName       string
+	OnToolResult    func(name, result string)
 }
 
 func New(cfg Config) *Agent {
@@ -43,13 +52,18 @@ func New(cfg Config) *Agent {
 		verbose:         cfg.Verbose,
 		maxIterations:   cfg.MaxIterations,
 		toolOutputLimit: cfg.ToolOutputLimit,
+		dupCallWindow:   cfg.DupCallWindow,
 		modelName:       cfg.ModelName,
+		onToolResult:    cfg.OnToolResult,
 	}
 	if a.maxIterations <= 0 {
 		a.maxIterations = 8
 	}
 	if a.toolOutputLimit <= 0 {
 		a.toolOutputLimit = 2500
+	}
+	if a.dupCallWindow <= 0 {
+		a.dupCallWindow = 3
 	}
 	return a
 }
@@ -60,11 +74,38 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 	}
 }
 
+// Messages 返回当前对话历史的副本（含 system）。
+func (a *Agent) Messages() []llm.Message {
+	out := make([]llm.Message, len(a.messages))
+	copy(out, a.messages)
+	return out
+}
+
+// LoadMessages 用快照替换历史，但保留首条 system prompt 不被覆盖。
+func (a *Agent) LoadMessages(msgs []llm.Message) {
+	if len(a.messages) > 0 && a.messages[0].Role == "system" {
+		sys := a.messages[0]
+		a.messages = []llm.Message{sys}
+		// 跳过 snapshot 的首条 system 避免重复
+		start := 0
+		if len(msgs) > 0 && msgs[0].Role == "system" {
+			start = 1
+		}
+		a.messages = append(a.messages, msgs[start:]...)
+	} else {
+		a.messages = append([]llm.Message(nil), msgs...)
+	}
+}
+
 func (a *Agent) Run(ctx context.Context, userInput string) error {
 	a.messages = append(a.messages, llm.Message{
 		Role:    "user",
 		Content: userInput,
 	})
+
+	// 单次 Run 内的工具调用签名滚动窗口
+	var recentSigs []string
+	dupCounts := map[string]int{}
 
 	for i := 0; i < a.maxIterations; i++ {
 		a.messages = a.ctxMgr.TrimMessages(a.messages)
@@ -73,45 +114,75 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		var err error
 
 		if a.useFC {
-			// 使用原生function calling
 			toolDefs := a.registry.FormatToolsJSON()
 			resp, err = a.client.ChatStream(ctx, a.messages, toolDefs, func(chunk string) {
 				fmt.Print(chunk)
 			})
 		} else {
-			// 使用prompt-based工具调用，先流式输出
 			var fullContent strings.Builder
 			resp, err = a.client.ChatStream(ctx, a.messages, nil, func(chunk string) {
 				fmt.Print(chunk)
 				fullContent.WriteString(chunk)
 			})
 			if err == nil {
-				// 从完整输出中解析工具调用
-				cleanText, toolCalls := llm.ParseToolCallsFromText(fullContent.String())
+				cleanText, toolCalls, warnings := llm.ParseToolCallsFromTextV2(fullContent.String())
 				resp.Content = cleanText
 				resp.ToolCalls = toolCalls
+				if len(warnings) > 0 && len(toolCalls) == 0 {
+					// 解析失败且无任何成功调用 → 给模型反馈让它重试
+					fmt.Printf("\n\033[33m[解析告警] %s\033[0m\n", strings.Join(warnings, "；"))
+					a.messages = append(a.messages, llm.Message{
+						Role:    "system",
+						Content: "上一条回复包含疑似工具调用块但解析失败：" + strings.Join(warnings, "；") + "。请严格使用 ```tool {\"name\":\"...\",\"args\":{...}} ``` 格式重新输出。",
+					})
+					continue
+				}
 			}
 		}
 
 		if err != nil {
-			return fmt.Errorf("LLM error: %w", err)
+			return fmt.Errorf("LLM error: %w", friendlyLLMError(err))
 		}
 
 		// 如果有工具调用
 		if len(resp.ToolCalls) > 0 {
-			fmt.Println() // 换行
+			fmt.Println()
 
-			// 记录assistant消息（带tool_calls）
 			a.messages = append(a.messages, llm.Message{
 				Role:      "assistant",
 				Content:   resp.Content,
 				ToolCalls: resp.ToolCalls,
 			})
 
-			// 执行每个工具调用
 			for _, tc := range resp.ToolCalls {
 				toolName := tc.Function.Name
-				fmt.Printf("\033[36m[工具调用] %s\033[0m\n", toolName)
+				fmt.Printf("\033[35m◆ [%d/%d] %s\033[0m\n", i+1, a.maxIterations, toolName)
+
+				// 重复检测
+				sig := callSig(toolName, tc.Function.Arguments)
+				dupCounts[sig]++
+				recentSigs = append(recentSigs, sig)
+				if len(recentSigs) > a.dupCallWindow {
+					old := recentSigs[0]
+					recentSigs = recentSigs[1:]
+					if dupCounts[old] > 0 {
+						dupCounts[old]--
+					}
+				}
+				if dupCounts[sig] >= 2 {
+					hint := fmt.Sprintf("已检测到重复调用 %s（最近 %d 步内出现 %d 次相同参数）。请基于上一次结果继续，或换不同参数。", toolName, a.dupCallWindow, dupCounts[sig])
+					fmt.Printf("\033[33m  ⟲ %s\033[0m\n", hint)
+					a.messages = append(a.messages, llm.Message{
+						Role:       "tool",
+						Content:    hint,
+						ToolCallID: tc.ID,
+					})
+					if dupCounts[sig] >= 3 {
+						fmt.Printf("\033[31m  [循环保护] 同参数连续 ≥3 次，本轮终止。\033[0m\n")
+						return nil
+					}
+					continue
+				}
 
 				tool, ok := a.registry.Get(toolName)
 				if !ok {
@@ -137,19 +208,22 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 					continue
 				}
 
-				if a.verbose {
-					fmt.Printf("\033[90m  参数: %s\033[0m\n", tc.Function.Arguments)
-				}
+				summary := toolSummary(toolName, args)
+				fmt.Printf("\033[90m  %s\033[0m\n", summary)
 
 				result, err := tool.Execute(ctx, args)
 				if err != nil {
 					result = fmt.Sprintf("错误: %s", err)
-					fmt.Printf("\033[31m[结果] %s\033[0m\n", result)
+					fmt.Printf("\033[31m  ✗ %s\033[0m\n", result)
 				} else {
 					result = TruncateOutput(result, a.toolOutputLimit)
 					if a.verbose {
-						fmt.Printf("\033[32m[结果]\033[0m\n%s\n", result)
+						fmt.Printf("\033[90m[输出]\033[0m\n%s\n", result)
 					}
+				}
+
+				if a.onToolResult != nil {
+					a.onToolResult(toolName, result)
 				}
 
 				a.messages = append(a.messages, llm.Message{
@@ -159,11 +233,10 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 				})
 			}
 
-			fmt.Println() // 工具执行完毕，继续循环让模型处理结果
+			fmt.Println()
 			continue
 		}
 
-		// 没有工具调用，是纯文本回复
 		fmt.Println()
 		if resp.Content != "" {
 			a.messages = append(a.messages, llm.Message{
@@ -174,7 +247,73 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		return nil
 	}
 
-	return fmt.Errorf("达到最大工具调用次数限制(%d)", a.maxIterations)
+	// 软退出：让模型基于已有信息收尾，而不是直接抛错
+	fmt.Printf("\n\033[33m[已达最大工具调用上限 %d，强制收尾]\033[0m\n", a.maxIterations)
+	wrapMsgs := append([]llm.Message{}, a.messages...)
+	wrapMsgs = append(wrapMsgs, llm.Message{
+		Role:    "user",
+		Content: "本轮已达最大工具调用上限。请基于已有信息直接给出当前结论或下一步建议，不要再调用任何工具。",
+	})
+	resp, werr := a.client.ChatStream(ctx, wrapMsgs, nil, func(chunk string) {
+		fmt.Print(chunk)
+	})
+	if werr != nil {
+		return fmt.Errorf("达到最大工具调用次数限制(%d)；后续收尾失败: %w", a.maxIterations, werr)
+	}
+	fmt.Println()
+	if resp != nil && resp.Content != "" {
+		a.messages = append(a.messages, llm.Message{Role: "assistant", Content: resp.Content})
+	}
+	return nil
+}
+
+// callSig 把工具名 + 排序后的参数 JSON 哈希成签名。
+func callSig(name, argsJSON string) string {
+	// 把 args JSON 标准化（排序 key），避免空白/顺序差异导致 hash 不同
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &raw); err == nil {
+		keys := make([]string, 0, len(raw))
+		for k := range raw {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var sb strings.Builder
+		for _, k := range keys {
+			sb.WriteString(k)
+			sb.WriteString("=")
+			b, _ := json.Marshal(raw[k])
+			sb.Write(b)
+			sb.WriteString(";")
+		}
+		argsJSON = sb.String()
+	}
+	h := sha1.Sum([]byte(name + "|" + argsJSON))
+	return name + "|" + hex.EncodeToString(h[:])[:16]
+}
+
+// friendlyLLMError 把常见网络/HTTP 错误转成可执行建议。
+func friendlyLLMError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "stream idle timeout"):
+		return fmt.Errorf("LLM 输出空闲超时（已 cancel）；模型可能太慢或卡住，可调高 llm.stream_idle_sec 或换更小模型")
+	case strings.Contains(msg, "deadline exceeded"):
+		return fmt.Errorf("LLM 总超时；可调高 llm.stream_timeout_sec 或检查模型负载")
+	case strings.Contains(msg, "401"), strings.Contains(msg, "403"):
+		return fmt.Errorf("LLM 认证失败：检查 config.yaml 的 api_key")
+	case strings.Contains(msg, "404"):
+		return fmt.Errorf("LLM 接口 404：base_url 可能未带 /v1 或模型名错误")
+	case strings.Contains(msg, "connection refused"):
+		return fmt.Errorf("LLM 连接拒绝：服务未启动？运行 /health 排查")
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return fmt.Errorf("LLM 网络错误：%w", err)
+	}
+	return err
 }
 
 // ClearHistory 清空对话历史（保留system prompt）
@@ -199,22 +338,35 @@ func (a *Agent) PrintStatus() {
 }
 
 // LoadSystemPrompt 从文件加载系统提示词，注入工具描述
-func LoadSystemPrompt(path string, registry *tools.Registry, runtimeHint string) (string, error) {
+// useFC=true 时会移除 ## 工具调用格式 整段并使用精简的工具描述（节省 context）。
+func LoadSystemPrompt(path string, registry *tools.Registry, runtimeHint string, useFC bool) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		// 如果文件不存在，返回默认提示词
-		return injectPromptPlaceholders(defaultSystemPrompt(registry), registry, runtimeHint), nil
+		return injectPromptPlaceholders(defaultSystemPrompt(registry), registry, runtimeHint, useFC), nil
 	}
 
 	prompt := string(data)
-	return injectPromptPlaceholders(prompt, registry, runtimeHint), nil
+	return injectPromptPlaceholders(prompt, registry, runtimeHint, useFC), nil
 }
 
-func injectPromptPlaceholders(prompt string, registry *tools.Registry, runtimeHint string) string {
+func injectPromptPlaceholders(prompt string, registry *tools.Registry, runtimeHint string, useFC bool) string {
 	// 替换工具描述占位符
-	if strings.Contains(prompt, "{{TOOLS}}") {
-		prompt = strings.Replace(prompt, "{{TOOLS}}", registry.FormatToolsPrompt(), 1)
+	toolsBlock := registry.FormatToolsPrompt()
+	if useFC {
+		toolsBlock = registry.FormatToolsBrief()
 	}
+	if strings.Contains(prompt, "{{TOOLS}}") {
+		prompt = strings.Replace(prompt, "{{TOOLS}}", toolsBlock, 1)
+	} else {
+		prompt += "\n\n## 可用工具\n\n" + toolsBlock + "\n"
+	}
+
+	// FC 模式下删除 "## 工具调用格式" 整段（直到下一个 "## " 或文末）
+	if useFC {
+		prompt = stripSection(prompt, "## 工具调用格式")
+	}
+
 	if runtimeHint != "" {
 		if strings.Contains(prompt, "{{RUNTIME}}") {
 			prompt = strings.Replace(prompt, "{{RUNTIME}}", runtimeHint, 1)
@@ -223,6 +375,55 @@ func injectPromptPlaceholders(prompt string, registry *tools.Registry, runtimeHi
 		}
 	}
 	return prompt
+}
+
+// stripSection 删除从 "## title" 开头到下一个 "## " 之前的整段。
+func stripSection(prompt, title string) string {
+	idx := strings.Index(prompt, title)
+	if idx < 0 {
+		return prompt
+	}
+	// 找下一个二级标题
+	rest := prompt[idx+len(title):]
+	nextIdx := strings.Index(rest, "\n## ")
+	if nextIdx < 0 {
+		return strings.TrimRight(prompt[:idx], "\n") + "\n"
+	}
+	return strings.TrimRight(prompt[:idx], "\n") + "\n" + rest[nextIdx+1:]
+}
+
+// toolSummary 从工具参数中提取简短的可读描述
+func toolSummary(name string, args map[string]any) string {
+	str := func(key string) string {
+		v, _ := args[key].(string)
+		return v
+	}
+	switch name {
+	case "run_command", "ssh_command", "kali_command":
+		return str("command")
+	case "read_file":
+		return str("path")
+	case "edit_file":
+		action := str("action")
+		path := str("path")
+		if action != "" {
+			return action + " " + path
+		}
+		return path
+	case "web_fetch":
+		return str("url")
+	default:
+		// 通用：取第一个字符串参数值
+		for _, v := range args {
+			if s, ok := v.(string); ok && s != "" {
+				if len(s) > 80 {
+					return s[:80] + "…"
+				}
+				return s
+			}
+		}
+		return ""
+	}
 }
 
 func defaultSystemPrompt(registry *tools.Registry) string {

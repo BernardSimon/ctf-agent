@@ -42,7 +42,7 @@ go build -ldflags="-s -w" -o ctf-agent .
 **2. 配置**
 
 ```bash
-cp config.example.yaml config.yaml
+cp config.yaml config.yaml
 vim config.yaml
 ```
 

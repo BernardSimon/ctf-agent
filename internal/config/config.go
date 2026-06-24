@@ -16,11 +16,16 @@ type Config struct {
 }
 
 type LLMConfig struct {
-	Provider string `yaml:"provider"` // "ollama" | "openai"
-	BaseURL  string `yaml:"base_url"`
-	Model    string `yaml:"model"`
-	APIKey   string `yaml:"api_key"`
-	UseFC    bool   `yaml:"function_calling"`
+	Provider         string  `yaml:"provider"` // "ollama" | "openai"
+	BaseURL          string  `yaml:"base_url"`
+	Model            string  `yaml:"model"`
+	APIKey           string  `yaml:"api_key"`
+	UseFC            bool    `yaml:"function_calling"`
+	Temperature      float64 `yaml:"temperature"`
+	TopP             float64 `yaml:"top_p"`
+	MaxTokens        int     `yaml:"max_tokens"`
+	StreamTimeoutSec int     `yaml:"stream_timeout_sec"`
+	StreamIdleSec    int     `yaml:"stream_idle_sec"`
 }
 
 type RuntimeConfig struct {
@@ -38,21 +43,34 @@ type SSHConfig struct {
 }
 
 type AgentConfig struct {
-	MaxContext            int    `yaml:"max_context_tokens"`
-	MaxHistory            int    `yaml:"max_history_messages"`
-	MaxIterations         int    `yaml:"max_tool_iterations"`
-	ToolOutputLimit       int    `yaml:"tool_output_limit"`
-	CommandTimeoutSeconds int    `yaml:"command_timeout_seconds"`
-	OfflineMode           bool   `yaml:"offline_mode"`
-	SystemPrompt          string `yaml:"system_prompt_file"`
+	MaxContext            int     `yaml:"max_context_tokens"`
+	MaxHistory            int     `yaml:"max_history_messages"`
+	MaxIterations         int     `yaml:"max_tool_iterations"`
+	ToolOutputLimit       int     `yaml:"tool_output_limit"`
+	CommandTimeoutSeconds int     `yaml:"command_timeout_seconds"`
+	OfflineMode           bool    `yaml:"offline_mode"`
+	SystemPrompt          string  `yaml:"system_prompt_file"`
+	JobsDir               string  `yaml:"jobs_dir"`
+	SessionDir            string  `yaml:"session_dir"`
+	FindingsDir           string  `yaml:"findings_dir"`
+	DocDir                string  `yaml:"doc_dir"`
+	DupCallWindow         int     `yaml:"dup_call_window"`
+	TokenCharRatioCJK     float64 `yaml:"token_char_ratio_cjk"`
+	TokenCharRatioASCII   float64 `yaml:"token_char_ratio_ascii"`
+	BinaryPreviewBytes    int     `yaml:"binary_preview_bytes"`
 }
 
 func Default() *Config {
 	return &Config{
 		LLM: LLMConfig{
-			Provider: "ollama",
-			BaseURL:  "http://localhost:11434",
-			Model:    "qwen2.5:14b",
+			Provider:         "ollama",
+			BaseURL:          "http://localhost:11434",
+			Model:            "qwen2.5:14b",
+			Temperature:      0.2,
+			TopP:             0.8,
+			MaxTokens:        2048,
+			StreamTimeoutSec: 180,
+			StreamIdleSec:    60,
 		},
 		Runtime: RuntimeConfig{
 			Mode: "local",
@@ -64,13 +82,21 @@ func Default() *Config {
 			CommandTimeoutSeconds: 300,
 		},
 		Agent: AgentConfig{
-			MaxContext:            4096,
-			MaxHistory:            20,
+			MaxContext:            6144,
+			MaxHistory:            16,
 			MaxIterations:         8,
 			ToolOutputLimit:       2500,
 			CommandTimeoutSeconds: 120,
 			OfflineMode:           true,
 			SystemPrompt:          "system_prompt.txt",
+			JobsDir:               ".ctf-agent/jobs",
+			SessionDir:            ".ctf-agent/sessions",
+			FindingsDir:           ".ctf-agent/findings",
+			DocDir:                "doc",
+			DupCallWindow:         3,
+			TokenCharRatioCJK:     1.4,
+			TokenCharRatioASCII:   3.5,
+			BinaryPreviewBytes:    4096,
 		},
 	}
 }
@@ -123,10 +149,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("ssh.host is required when runtime.mode is 'ssh_kali'")
 	}
 	if c.Agent.MaxContext == 0 {
-		c.Agent.MaxContext = 4096
+		c.Agent.MaxContext = 6144
 	}
 	if c.Agent.MaxHistory == 0 {
-		c.Agent.MaxHistory = 20
+		c.Agent.MaxHistory = 16
 	}
 	if c.Agent.MaxIterations == 0 {
 		c.Agent.MaxIterations = 8
@@ -139,6 +165,45 @@ func (c *Config) Validate() error {
 	}
 	if c.SSH.CommandTimeoutSeconds == 0 {
 		c.SSH.CommandTimeoutSeconds = 300
+	}
+	if c.Agent.JobsDir == "" {
+		c.Agent.JobsDir = ".ctf-agent/jobs"
+	}
+	if c.Agent.SessionDir == "" {
+		c.Agent.SessionDir = ".ctf-agent/sessions"
+	}
+	if c.Agent.FindingsDir == "" {
+		c.Agent.FindingsDir = ".ctf-agent/findings"
+	}
+	if c.Agent.DocDir == "" {
+		c.Agent.DocDir = "doc"
+	}
+	if c.Agent.DupCallWindow == 0 {
+		c.Agent.DupCallWindow = 3
+	}
+	if c.Agent.TokenCharRatioCJK <= 0 {
+		c.Agent.TokenCharRatioCJK = 1.4
+	}
+	if c.Agent.TokenCharRatioASCII <= 0 {
+		c.Agent.TokenCharRatioASCII = 3.5
+	}
+	if c.Agent.BinaryPreviewBytes <= 0 {
+		c.Agent.BinaryPreviewBytes = 4096
+	}
+	if c.LLM.Temperature == 0 {
+		c.LLM.Temperature = 0.2
+	}
+	if c.LLM.TopP == 0 {
+		c.LLM.TopP = 0.8
+	}
+	if c.LLM.MaxTokens == 0 {
+		c.LLM.MaxTokens = 2048
+	}
+	if c.LLM.StreamTimeoutSec == 0 {
+		c.LLM.StreamTimeoutSec = 180
+	}
+	if c.LLM.StreamIdleSec == 0 {
+		c.LLM.StreamIdleSec = 60
 	}
 	return nil
 }
@@ -171,6 +236,16 @@ llm:
   #   false = 从模型输出文本中解析工具调用（默认，兼容所有模型）
   #   true  = 使用原生function calling接口（需要模型支持）
   function_calling: false
+
+  # 推理参数（CTF 场景建议低温度，避免模型瞎猜）
+  temperature: 0.2
+  top_p: 0.8
+  max_tokens: 2048
+
+  # 流式响应总超时和"无 chunk 空闲"超时（秒）
+  # 模型卡死时这两个值都会触发自动 cancel + 重试
+  stream_timeout_sec: 180
+  stream_idle_sec: 60
 
 runtime:
   # 运行环境:
@@ -225,6 +300,25 @@ agent:
   # 系统提示词文件（相对于程序目录）
   # 可自定义提示词，{{TOOLS}} 会被替换为工具描述
   system_prompt_file: system_prompt.txt
+
+  # 后台任务/会话/发现目录（相对于工作目录；不可写时降级到 ~/.ctf-agent/<wd-hash>/）
+  jobs_dir: .ctf-agent/jobs
+  session_dir: .ctf-agent/sessions
+  findings_dir: .ctf-agent/findings
+
+  # 知识库目录（相对于程序目录）
+  doc_dir: doc
+
+  # 同一工具+参数在最近 N 次工具调用内出现 ≥2 次时拦截，避免小模型陷循环
+  dup_call_window: 3
+
+  # token 估算系数：每个 CJK 字符按 1/cjk 个 token，每个 ASCII 字符按 1/ascii 个 token
+  # Qwen2.5 默认 1.4 / 3.5；Llama3 系建议改 1.6 / 3.5
+  token_char_ratio_cjk: 1.4
+  token_char_ratio_ascii: 3.5
+
+  # read_file 自动模式的二进制探测窗口字节数
+  binary_preview_bytes: 4096
 `
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {

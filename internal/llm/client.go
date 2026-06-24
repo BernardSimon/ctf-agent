@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,14 +52,32 @@ type Response struct {
 }
 
 type Client struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	useFC      bool
-	httpClient *http.Client
+	baseURL       string
+	apiKey        string
+	model         string
+	useFC         bool
+	httpClient    *http.Client
+	temperature   *float64
+	topP          *float64
+	maxTokens     *int
+	streamTimeout time.Duration
+	streamIdle    time.Duration
+}
+
+// ClientOptions 控制采样和流式行为；零值表示走服务端默认。
+type ClientOptions struct {
+	Temperature      float64
+	TopP             float64
+	MaxTokens        int
+	StreamTimeoutSec int
+	StreamIdleSec    int
 }
 
 func NewClient(baseURL, apiKey, model string, useFC bool) *Client {
+	return NewClientWithOpts(baseURL, apiKey, model, useFC, ClientOptions{})
+}
+
+func NewClientWithOpts(baseURL, apiKey, model string, useFC bool, opts ClientOptions) *Client {
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -67,13 +86,36 @@ func NewClient(baseURL, apiKey, model string, useFC bool) *Client {
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 	}
-	return &Client{
+	c := &Client{
 		baseURL:    normalizeBaseURL(baseURL),
 		apiKey:     apiKey,
 		model:      model,
 		useFC:      useFC,
 		httpClient: &http.Client{Transport: transport},
 	}
+	if opts.Temperature != 0 {
+		v := opts.Temperature
+		c.temperature = &v
+	}
+	if opts.TopP != 0 {
+		v := opts.TopP
+		c.topP = &v
+	}
+	if opts.MaxTokens != 0 {
+		v := opts.MaxTokens
+		c.maxTokens = &v
+	}
+	if opts.StreamTimeoutSec > 0 {
+		c.streamTimeout = time.Duration(opts.StreamTimeoutSec) * time.Second
+	} else {
+		c.streamTimeout = 180 * time.Second
+	}
+	if opts.StreamIdleSec > 0 {
+		c.streamIdle = time.Duration(opts.StreamIdleSec) * time.Second
+	} else {
+		c.streamIdle = 60 * time.Second
+	}
+	return c
 }
 
 func normalizeBaseURL(baseURL string) string {
@@ -88,10 +130,28 @@ func normalizeBaseURL(baseURL string) string {
 }
 
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
-	Tools    []ToolDef `json:"tools,omitempty"`
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Stream      bool      `json:"stream"`
+	Tools       []ToolDef `json:"tools,omitempty"`
+	Temperature *float64  `json:"temperature,omitempty"`
+	TopP        *float64  `json:"top_p,omitempty"`
+	MaxTokens   *int      `json:"max_tokens,omitempty"`
+}
+
+func (c *Client) applySamplingOpts(req *chatRequest) {
+	if c.temperature != nil {
+		v := *c.temperature
+		req.Temperature = &v
+	}
+	if c.topP != nil {
+		v := *c.topP
+		req.TopP = &v
+	}
+	if c.maxTokens != nil {
+		v := *c.maxTokens
+		req.MaxTokens = &v
+	}
 }
 
 type chatResponse struct {
@@ -130,6 +190,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []map[strin
 	if c.useFC && len(toolDefs) > 0 {
 		reqBody.Tools = toolDefs
 	}
+	c.applySamplingOpts(&reqBody)
 
 	return c.doRequest(ctx, reqBody)
 }
@@ -159,6 +220,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []map
 	if c.useFC && len(toolDefs) > 0 {
 		reqBody.Tools = toolDefs
 	}
+	c.applySamplingOpts(&reqBody)
 
 	return c.doStreamRequestWithRetry(ctx, reqBody, onChunk)
 }
@@ -196,6 +258,12 @@ func (c *Client) doStreamRequestWithRetry(ctx context.Context, reqBody chatReque
 func shouldRetryError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errStreamIdle) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	// 检查是否为网络错误
 	var netErr net.Error
@@ -256,14 +324,20 @@ func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (*Response,
 	}, nil
 }
 
+var errStreamIdle = errors.New("stream idle timeout (no chunk received)")
+
 func (c *Client) doStreamRequest(ctx context.Context, reqBody chatRequest, onChunk func(string)) (*Response, error) {
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
 
+	// 总超时
+	streamCtx, cancelTotal := context.WithTimeout(ctx, c.streamTimeout)
+	defer cancelTotal()
+
 	url := c.baseURL + "/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(streamCtx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +363,44 @@ func (c *Client) doStreamRequest(ctx context.Context, reqBody chatRequest, onChu
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	// 空闲超时：监控 lastChunkAt，超过阈值则 cancel streamCtx
+	var lastChunkAt time.Time
+	var lastMu sync.Mutex
+	lastChunkAt = time.Now()
+	idleStop := make(chan struct{})
+	idleErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(c.streamIdle / 2)
+		if c.streamIdle/2 < time.Second {
+			ticker = time.NewTicker(time.Second)
+		}
+		defer ticker.Stop()
+		for {
+			select {
+			case <-idleStop:
+				return
+			case <-ticker.C:
+				lastMu.Lock()
+				since := time.Since(lastChunkAt)
+				lastMu.Unlock()
+				if since > c.streamIdle {
+					select {
+					case idleErr <- errStreamIdle:
+					default:
+					}
+					cancelTotal()
+					return
+				}
+			}
+		}
+	}()
+	defer close(idleStop)
+
 	for scanner.Scan() {
+		lastMu.Lock()
+		lastChunkAt = time.Now()
+		lastMu.Unlock()
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -340,6 +451,12 @@ func (c *Client) doStreamRequest(ctx context.Context, reqBody chatRequest, onChu
 	}
 
 	if err := scanner.Err(); err != nil {
+		// 优先报告空闲超时（更具体）
+		select {
+		case e := <-idleErr:
+			return nil, e
+		default:
+		}
 		return nil, fmt.Errorf("read stream: %w", err)
 	}
 
@@ -382,8 +499,13 @@ func (c *Client) CheckConnection(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("LLM服务错误: HTTP %d", resp.StatusCode)
+	switch {
+	case resp.StatusCode == 401, resp.StatusCode == 403:
+		return fmt.Errorf("认证失败 HTTP %d，请检查 api_key", resp.StatusCode)
+	case resp.StatusCode == 404:
+		return fmt.Errorf("HTTP 404，base_url 可能未带 /v1 或路径错误（当前 %s）", c.baseURL)
+	case resp.StatusCode >= 400:
+		return fmt.Errorf("LLM服务返回 HTTP %d", resp.StatusCode)
 	}
 	return nil
 }

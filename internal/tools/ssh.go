@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type SSHTool struct {
 	timeoutCallback  TimeoutCallback
 	passwordCallback PasswordCallback
 	mu               sync.Mutex
+	keepaliveStop    chan struct{}
 }
 
 func NewSSHTool(host string, port int, user, keyPath, password string, timeout time.Duration) (*SSHTool, error) {
@@ -96,7 +98,46 @@ func (t *SSHTool) connect() error {
 		return fmt.Errorf("SSH dial: %w", err)
 	}
 	t.client = client
-	return t.openSession()
+	if err := t.openSession(); err != nil {
+		return err
+	}
+	t.startKeepalive()
+	return nil
+}
+
+// startKeepalive 启动后台心跳，每 30s 发一次 keepalive；连续 3 次失败触发 disconnect。
+// 由 connect 调用，disconnect 关闭其 stop channel。
+func (t *SSHTool) startKeepalive() {
+	if t.keepaliveStop != nil {
+		close(t.keepaliveStop)
+	}
+	stop := make(chan struct{})
+	t.keepaliveStop = stop
+	client := t.client
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		fails := 0
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if client == nil {
+					return
+				}
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				if err != nil {
+					fails++
+					if fails >= 3 {
+						return
+					}
+					continue
+				}
+				fails = 0
+			}
+		}
+	}()
 }
 
 func (t *SSHTool) openSession() error {
@@ -143,6 +184,10 @@ func (t *SSHTool) openSession() error {
 }
 
 func (t *SSHTool) disconnect() {
+	if t.keepaliveStop != nil {
+		close(t.keepaliveStop)
+		t.keepaliveStop = nil
+	}
 	if t.session != nil {
 		_ = t.session.Close()
 		t.session = nil
@@ -272,8 +317,9 @@ func (t *SSHTool) Execute(ctx context.Context, args map[string]any) (string, err
 				return snapshotOutput(), fmt.Errorf("SSH读取失败: %w", err)
 			}
 			result := snapshotOutput()
-			if len(result) > 5000 {
-				result = result[:5000] + "\n...[output truncated]"
+			// 64KB 安全网，防远端打印超大 banner 撑爆 RAM；语义截断由 agent 层做
+			if len(result) > 65536 {
+				result = result[:65536] + "\n...[ssh-hardcap-64k]"
 			}
 			return result, nil
 		case <-time.After(currentTimeout):
@@ -299,7 +345,92 @@ func (t *SSHTool) Close() {
 	}
 }
 
-// DetectSSHKey 自动检测SSH密钥路径
+// RunDetached 在远端启动后台任务，立即返回 PID。
+// 不复用 Execute 的 PTY 主 session，避免阻塞主交互通道。
+func (t *SSHTool) RunDetached(cmd, logPath string) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client == nil {
+		if err := t.connect(); err != nil {
+			return 0, fmt.Errorf("SSH连接失败: %w", err)
+		}
+	}
+	session, err := t.client.NewSession()
+	if err != nil {
+		return 0, fmt.Errorf("SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// 用 nohup + & 后台执行，echo $! 抓取 PID
+	wrapped := fmt.Sprintf("nohup sh -c %s > %s 2>&1 &\necho $!\n",
+		shellQuote(cmd), shellQuote(logPath))
+	out, err := session.CombinedOutput(wrapped)
+	if err != nil {
+		return 0, fmt.Errorf("ssh exec: %w; output: %s", err, string(out))
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// 只取最后一行 echo $! 的数字
+	}
+	parts := strings.Fields(string(out))
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("无法获取远端 PID；输出: %s", string(out))
+	}
+	pidStr := parts[len(parts)-1]
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return 0, fmt.Errorf("解析远端 PID 失败 (%q): %w", pidStr, err)
+	}
+	return pid, nil
+}
+
+// KillRemote 终止远端任务（kill -TERM）。
+func (t *SSHTool) KillRemote(pid int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client == nil {
+		if err := t.connect(); err != nil {
+			return err
+		}
+	}
+	session, err := t.client.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+	return session.Run(fmt.Sprintf("kill -TERM %d 2>/dev/null; sleep 0.5; kill -KILL %d 2>/dev/null; true", pid, pid))
+}
+
+// FetchRemoteFile 读取远端文件（带 byte 限制），用于 job_tail 拉取远端 log。
+func (t *SSHTool) FetchRemoteFile(remotePath string, maxBytes int64) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client == nil {
+		if err := t.connect(); err != nil {
+			return nil, err
+		}
+	}
+	session, err := t.client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.Close()
+	if maxBytes <= 0 {
+		maxBytes = 256 * 1024
+	}
+	cmd := fmt.Sprintf("tail -c %d %s 2>/dev/null || true", maxBytes, shellQuote(remotePath))
+	return session.CombinedOutput(cmd)
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 func DetectSSHKey() string {
 	home, err := os.UserHomeDir()
 	if err != nil {

@@ -86,6 +86,22 @@ func (r *Registry) FormatToolsPrompt() string {
 	return sb.String()
 }
 
+// FormatToolsBrief 仅给出 name + 一行描述，FC 模式下用于节省 context（参数 schema 由 OpenAI tools 字段携带）。
+func (r *Registry) FormatToolsBrief() string {
+	var sb strings.Builder
+	for _, t := range r.All() {
+		desc := t.Description()
+		if idx := strings.Index(desc, "\n"); idx > 0 {
+			desc = desc[:idx]
+		}
+		if len(desc) > 100 {
+			desc = desc[:100] + "…"
+		}
+		sb.WriteString(fmt.Sprintf("- %s — %s\n", t.Name(), desc))
+	}
+	return sb.String()
+}
+
 // FormatToolsJSON 生成OpenAI function calling格式的tools定义
 func (r *Registry) FormatToolsJSON() []map[string]any {
 	var tools []map[string]any

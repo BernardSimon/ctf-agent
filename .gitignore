@@ -5,6 +5,9 @@ ctf-agent
 # Config with potential secrets
 config.yaml
 
+# Runtime data (jobs/sessions/findings)
+.ctf-agent/
+
 # macOS
 .DS_Store
 

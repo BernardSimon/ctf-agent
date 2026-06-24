@@ -111,9 +111,6 @@ func (t *CommandTool) Execute(ctx context.Context, args map[string]any) (string,
 			cancel()
 			stdin.Close()
 			result := strings.TrimSpace(output.String())
-			if len(result) > 3000 {
-				result = result[:3000] + "\n...[output truncated]"
-			}
 			if err != nil {
 				if exitErr, ok := err.(*exec.ExitError); ok {
 					return fmt.Sprintf("%s\n[exit code: %d]", result, exitErr.ExitCode()), nil
