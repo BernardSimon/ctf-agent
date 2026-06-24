@@ -41,6 +41,15 @@ func exeDir() string {
 	return filepath.Dir(real)
 }
 
+func newReadlineInputFilter() func(rune) (rune, bool) {
+	return func(r rune) (rune, bool) {
+		if r == '\n' {
+			return ' ', true
+		}
+		return r, true
+	}
+}
+
 func main() {
 	configPath := flag.String("config", "", "配置文件路径（默认: 程序目录/config.yaml）")
 	initConfig := flag.Bool("init", false, "在程序目录生成默认配置文件和系统提示词")
@@ -283,20 +292,17 @@ func main() {
 		{Role: "system", Content: "你是一个CTF知识助手。用户会问你关于CTF、网络安全、漏洞利用、工具使用、编程等问题。你只需要清晰、准确地回答问题，不需要执行任何命令或调用工具。\n\n回答要求：\n- 使用Markdown格式组织答案（标题、代码块、列表）\n- 代码示例用合适的语言标记\n- 概念解释简洁明了\n- 如果问题涉及具体操作，给出命令示例但说明需要在Agent模式执行\n- 用中文回答"},
 	}
 
+	filterInputRune := newReadlineInputFilter()
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          "\033[32m❯ \033[0m",
 		HistoryFile:     filepath.Join(os.TempDir(), ".ctf-agent-history"),
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    &mention.FileCompleter{},
-		// 粘贴时终端会发 \n（10）作为换行；chzyer/readline 对此会触发 prompt 重绘 bug
-		// 把 \n 变成空格，回车（\r=13）仍然作为提交。
-		FuncFilterInputRune: func(r rune) (rune, bool) {
-			if r == '\n' {
-				return ' ', true
-			}
-			return r, true
-		},
+		// chzyer/readline 对长中文行的多行重绘容易留下旧 prompt。
+		// 提交后清掉编辑区，并把粘贴块里的换行折叠为空格，减少重绘残影。
+		UniqueEditLine:      true,
+		FuncFilterInputRune: filterInputRune,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "readline 初始化失败: %v\n", err)
