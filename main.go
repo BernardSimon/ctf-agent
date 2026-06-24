@@ -289,6 +289,14 @@ func main() {
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    &mention.FileCompleter{},
+		// 粘贴时终端会发 \n（10）作为换行；chzyer/readline 对此会触发 prompt 重绘 bug
+		// 把 \n 变成空格，回车（\r=13）仍然作为提交。
+		FuncFilterInputRune: func(r rune) (rune, bool) {
+			if r == '\n' {
+				return ' ', true
+			}
+			return r, true
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "readline 初始化失败: %v\n", err)

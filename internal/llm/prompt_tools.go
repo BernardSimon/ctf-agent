@@ -15,6 +15,14 @@ var fenceBlockPattern = regexp.MustCompile("(?s)```([a-zA-Z0-9_-]*)\\s*\n(.*?)\n
 // 实际使用时仍然以 fenceBlockPattern 优先；这条只对没匹配到围栏的输入兜底。
 var bareToolJSONHead = regexp.MustCompile(`(?m)^\s*(\{\s*"name"\s*:\s*".+?".*)$`)
 
+// toolCallTag 抓取 <tool_call>...</tool_call> 块。模型（Qwen/Llama 思维链微调版）有时
+// 会输出这种 Anthropic-style XML 标记而不是 ```tool 围栏。
+var toolCallTag = regexp.MustCompile(`(?s)<tool_call>\s*(.*?)\s*</tool_call>`)
+
+// xmlFunctionTag 抓取 <function=NAME>...</function> 嵌套；配套 <parameter=KEY>VALUE</parameter>。
+var xmlFunctionTag = regexp.MustCompile(`(?s)<function\s*=\s*"?([a-zA-Z_][a-zA-Z0-9_]*)"?\s*>(.*?)</function>`)
+var xmlParamTag = regexp.MustCompile(`(?s)<parameter\s*=\s*"?([a-zA-Z_][a-zA-Z0-9_]*)"?\s*>(.*?)</parameter>`)
+
 // 旧 toolCallPattern 仅用于向后兼容旧测试；新逻辑用 fenceBlockPattern。
 var toolCallPattern = regexp.MustCompile("(?s)```(?:tool|json|python|bash)?\\s*\n?(\\{\\s*\"name\"\\s*:.*?\\})\n?```")
 
@@ -60,7 +68,32 @@ func ParseToolCallsFromTextV2(text string) (cleanText string, toolCalls []ToolCa
 		}
 	}
 
-	// 兜底：裸 JSON
+	// 兜底 1：<tool_call>...</tool_call> 标记（Claude/Qwen 思维链微调风格）
+	tagMatches := toolCallTag.FindAllStringSubmatchIndex(text, -1)
+	if len(tagMatches) > 0 {
+		for idx := len(tagMatches) - 1; idx >= 0; idx-- {
+			m := tagMatches[idx]
+			body := strings.TrimSpace(text[m[2]:m[3]])
+			tc, ok, warn := tryParseToolCallTag(body)
+			if ok {
+				toolCalls = append([]ToolCall{tc}, toolCalls...)
+				cleanText = cleanText[:m[0]] + cleanText[m[1]:]
+				continue
+			}
+			if warn != "" {
+				warnings = append(warnings, warn)
+			}
+		}
+		for i := range toolCalls {
+			toolCalls[i].ID = fmt.Sprintf("call_%d", i)
+		}
+		cleanText = strings.TrimSpace(cleanText)
+		if len(toolCalls) > 0 || len(warnings) > 0 {
+			return cleanText, toolCalls, warnings
+		}
+	}
+
+	// 兜底 2：裸 JSON
 	bareMatches := bareToolJSONHead.FindAllStringSubmatchIndex(text, -1)
 	for _, m := range bareMatches {
 		head := text[m[2]:m[3]]
@@ -86,6 +119,40 @@ func ParseToolCallsFromTextV2(text string) (cleanText string, toolCalls []ToolCa
 	}
 	cleanText = strings.TrimSpace(cleanText)
 	return cleanText, toolCalls, warnings
+}
+
+// tryParseToolCallTag 解析 <tool_call>...</tool_call> 块的内部。
+// 支持两种形态：
+//  1. 内部是 JSON：{"name":"x","args":{...}}（或 "arguments"）
+//  2. 内部是 XML：<function=NAME><parameter=K>V</parameter>...</function>
+func tryParseToolCallTag(body string) (ToolCall, bool, string) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ToolCall{}, false, ""
+	}
+	// 形态 1：JSON
+	if strings.HasPrefix(body, "{") {
+		return tryParseToolJSON(body, "tool_call")
+	}
+	// 形态 2：嵌套 <function=NAME>...</function>
+	fm := xmlFunctionTag.FindStringSubmatch(body)
+	if fm != nil {
+		name := fm[1]
+		inner := fm[2]
+		args := map[string]any{}
+		for _, pm := range xmlParamTag.FindAllStringSubmatch(inner, -1) {
+			args[pm[1]] = strings.TrimSpace(pm[2])
+		}
+		argsJSON, _ := json.Marshal(args)
+		return ToolCall{
+			Type: "function",
+			Function: FunctionCall{
+				Name:      name,
+				Arguments: string(argsJSON),
+			},
+		}, true, ""
+	}
+	return ToolCall{}, false, fmt.Sprintf("检测到 <tool_call> 块但格式无法识别：%.80s", body)
 }
 
 // tryParseToolJSON 尝试把字符串当作 {"name":..,"args":..} 解析，成功返回 ToolCall。
