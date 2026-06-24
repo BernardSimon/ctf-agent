@@ -8,11 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"time"
 )
 
-// LocalRunner 在本机后台执行命令。任务进程脱离 Agent 进程组，Agent 退出后任务存活。
+// LocalRunner 在本机后台执行命令。Unix 上任务进程脱离 Agent 进程组，Agent 退出后任务存活。
+// Windows 暂不支持（applyDetachedAttrs 是 no-op）。
 type LocalRunner struct {
 	store *Store
 }
@@ -24,7 +24,7 @@ func NewLocalRunner(store *Store) *LocalRunner {
 // Start 启动本机后台任务，立即返回 Job（未阻塞）。
 func (r *LocalRunner) Start(cmd, tag string) (*Job, error) {
 	if runtime.GOOS == "windows" {
-		return nil, fmt.Errorf("background tasks are not supported on Windows yet")
+		return nil, fmt.Errorf("background tasks 暂不支持 Windows（缺少 fork-detach 语义），请用 ssh 到 Linux/Kali 执行")
 	}
 	cwd, _ := os.Getwd()
 	job, err := r.store.New(cmd, "local", tag, cwd)
@@ -49,7 +49,7 @@ func (r *LocalRunner) Start(cmd, tag string) (*Job, error) {
 	c.Stdout = stdoutFile
 	c.Stderr = stderrFile
 	c.Stdin = nil
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	applyDetachedAttrs(c)
 
 	if err := c.Start(); err != nil {
 		stdoutFile.Close()
@@ -84,7 +84,7 @@ func (r *LocalRunner) Start(cmd, tag string) (*Job, error) {
 	return job, nil
 }
 
-// Kill 向本机任务发送 SIGTERM，5s 后升级 SIGKILL。
+// Kill 向本机任务发送 SIGTERM，5s 后升级 SIGKILL（Windows 上直接 Kill）。
 func (r *LocalRunner) Kill(id string) error {
 	job, err := r.store.Get(id)
 	if err != nil {
@@ -93,11 +93,7 @@ func (r *LocalRunner) Kill(id string) error {
 	if job.Pid == 0 {
 		return fmt.Errorf("job %s has no pid", id)
 	}
-	proc, err := os.FindProcess(job.Pid)
-	if err != nil {
-		return err
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
+	if err := signalTerm(job.Pid); err != nil {
 		return err
 	}
 	job.Status = StatusKilled
@@ -111,7 +107,7 @@ func (r *LocalRunner) Kill(id string) error {
 		for {
 			select {
 			case <-ctx.Done():
-				_ = proc.Signal(syscall.SIGKILL)
+				_ = killHard(job.Pid)
 				return
 			case <-ticker.C:
 				if !pidAlive(job.Pid) {
@@ -123,15 +119,15 @@ func (r *LocalRunner) Kill(id string) error {
 	return nil
 }
 
-func pidAlive(pid int) bool {
+func findProc(pid int) (*os.Process, error) {
 	if pid <= 0 {
-		return false
+		return nil, fmt.Errorf("invalid pid %d", pid)
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	return os.FindProcess(pid)
+}
+
+func pidAlive(pid int) bool {
+	return signalAlive(pid)
 }
 
 // SSHDetacher 是 SSH 工具暴露给 jobs 包的最小接口；避免循环依赖。
