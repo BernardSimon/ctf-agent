@@ -107,11 +107,16 @@ func (r *Registry) FormatToolsJSON() []map[string]any {
 	var tools []map[string]any
 	for _, t := range r.All() {
 		props := make(map[string]any)
-		var required []string
+		required := []string{} // 必须是 [] 而非 null，OpenAI schema 严格校验
 		for _, p := range t.Parameters() {
 			prop := map[string]any{
 				"type":        p.Type,
 				"description": p.Description,
+			}
+			// object 类型必须带 properties；CTF 工具里 object 参数都是动态键值（headers/form/json），
+			// 用 additionalProperties:true 让任意键合法
+			if p.Type == "object" {
+				prop["additionalProperties"] = true
 			}
 			props[p.Name] = prop
 			if p.Required {
